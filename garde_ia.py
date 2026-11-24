@@ -14,11 +14,15 @@ from threading import TIMEOUT_MAX, Lock, Timer
 from typing import BinaryIO
 
 from supervision import ContexteReseau, Ordre, OutilSupervise, SuiviMission, TravailEnCours, maintenant
+from travail import (
+    AccesTravail, DonneesOutil, NOMS_RESERVES_WINDOWS, PorteeTravail, TAILLE_CONTENU_MAX,
+    ecrire_fichier, lire_fichier, portee_depuis_demande,
+)
 
-VERSION = "0.4.0"
+VERSION = "0.4.01"
 TAILLE_TEXTE_MAX = 4_096
 TAILLE_RAISONNEMENT_MAX = 16_384
-TAILLE_LIGNE_MAX = 128 * 1_024
+TAILLE_LIGNE_MAX = 1_024 * 1_024
 CHEVAUCHEMENT_FLUX = 2_048
 CANAUX_SURVEILLES = {"raisonnement", "donnees", "reponse"}
 CHAMPS_APPEL = {"action", "parametres", "intention", "raisonnement"}
@@ -26,7 +30,8 @@ CHAMPS_RAISONNEMENT = {"action", "cibles", "texte"}
 ACTIONS_SUPPRESSION = {"supprimer_fichier", "supprimer_dossier"}
 ACTIONS_MUTATION = ACTIONS_SUPPRESSION | {
     "ecrire_fichier", "modifier_fichier", "renommer_fichier", "deplacer_fichier",
-    "write_file", "edit_file", "delete_file", "delete_directory", "rename_file", "move_file",
+    "creer_fichier", "creer_dossier", "write_file", "edit_file", "create_file", "create_directory",
+    "delete_file", "delete_directory", "rename_file", "move_file",
 }
 CHAMPS_MUTATION = SuiviMission.CIBLES | {"cible", "dossier", "old_path", "new_path"}
 ACTIONS_SABOTAGE = {
@@ -85,7 +90,6 @@ DEMANDE_SUPPRESSION = re.compile(
     re.IGNORECASE,
 )
 CARACTERES_INTERDITS = re.compile(r'[\x00-\x1f\x7f<>:"|?*\[\]]')
-NOMS_RESERVES_WINDOWS = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])", re.IGNORECASE)
 
 
 def _normaliser(texte: str) -> str:
@@ -156,6 +160,7 @@ class GardeIA:
         conditions: dict[str, Callable[[dict[str, str]], bool]] | None = None,
         chemins_proteges: tuple[Path | str, ...] = (),
         racine_travail: Path | str | None = None,
+        portee_travail: PorteeTravail | None = None,
         mutations: dict[str, tuple[str, ...]] | None = None,
         arreter_agent: Callable[[], bool] | None = None,
         rapport: Path | str | None = None,
@@ -172,7 +177,7 @@ class GardeIA:
                 raise ValueError(f"Outil indisponible pour l’action {action!r}.")
             if not isinstance(champs, dict):
                 raise ValueError(f"Les paramètres de {action!r} doivent former un objet.")
-            if action in ACTIONS_TERMINAL and (not isinstance(outil, OutilSupervise) or any(v is None for v in champs.values())):
+            if action in ACTIONS_TERMINAL and (not isinstance(outil, OutilSupervise) or any(not isinstance(v, list) for v in champs.values())):
                 raise ValueError(f"La commande {action!r} exige un arrêt raccordé et des paramètres approuvés.")
             if action in ACTIONS_SUPPRESSION and champs != {"chemin": None}:
                 raise ValueError(f"L’action {action!r} requiert un unique paramètre « chemin » de règle null.")
@@ -187,8 +192,22 @@ class GardeIA:
                     regles[champ] = None
                 elif isinstance(valeurs, list) and valeurs and all(map(_texte_valide, valeurs)):
                     regles[champ] = frozenset(valeurs)
+                elif isinstance(valeurs, dict) and valeurs.keys() == {"travail"}:
+                    try:
+                        regles[champ] = AccesTravail(valeurs["travail"])
+                    except ValueError:
+                        raise ValueError(f"Accès de travail invalide pour {action!r}.{champ}.") from None
+                elif valeurs == {"donnees": "contenu"}:
+                    regles[champ] = DonneesOutil.CONTENU
                 else:
                     raise ValueError(f"Règle invalide pour {action!r}.{champ}.")
+            if DonneesOutil.CONTENU in regles.values() and AccesTravail.ECRITURE not in regles.values():
+                raise ValueError(f"Le contenu de {action!r} exige une cible d’écriture dans le périmètre de travail.")
+            champs_mutables = set((mutations or {}).get(action, ()))
+            if action in ACTIONS_MUTATION:
+                champs_mutables.update(CHAMPS_MUTATION)
+            if any(regles.get(champ) is AccesTravail.LECTURE for champ in champs_mutables):
+                raise ValueError(f"Une cible modifiée par {action!r} exige un accès de travail en écriture.")
             self._actions[action] = (outil, regles)
 
         self._termes = []
@@ -208,15 +227,20 @@ class GardeIA:
         if any(action not in self._actions or not callable(condition) for action, condition in self._conditions.items()):
             raise ValueError("Les conditions de contexte doivent viser des actions autorisées.")
         self._racine = Path(racine_travail or Path.cwd()).resolve()
+        self._travail = portee_travail.ancrer(self._racine) if portee_travail is not None else None
         programme = Path(__file__).resolve()
         proteges = (
             programme, programme.with_name("supervision.py"), programme.with_name("processus_mission.py"),
-            programme.parent / "__pycache__", *chemins_proteges,
+            programme.with_name("travail.py"), programme.parent / "__pycache__", *chemins_proteges,
         )
         if self._suivi.chemin_rapport is not None:
             proteges += (self._suivi.chemin_rapport,)
         self._proteges = tuple((self._racine / chemin).resolve() for chemin in proteges)
         self._mutations = {action: frozenset(champs) for action, champs in (mutations or {}).items()}
+        for action, (_, regles) in self._actions.items():
+            cibles_ecriture = frozenset(champ for champ, regle in regles.items() if regle is AccesTravail.ECRITURE)
+            if cibles_ecriture:
+                self._mutations[action] = self._mutations.get(action, frozenset()) | cibles_ecriture
 
     @property
     def etat(self) -> dict[str, object]:
@@ -296,6 +320,9 @@ class GardeIA:
             valeur = parametres.get(champ)
             if not isinstance(valeur, str) or not valeur or len(valeur) > TAILLE_TEXTE_MAX:
                 continue
+            if valeur.startswith(("\\\\", "//")):
+                motif = "chemin_suppression_invalide" if action in ACTIONS_SUPPRESSION else "cible_non_verifiable"
+                continue
             try:
                 cible = (self._racine / valeur).resolve()
             except (OSError, ValueError, RuntimeError):
@@ -336,10 +363,23 @@ class GardeIA:
             return _bloquer("action_non_autorisee")
 
         outil, regles = autorisation
-        if parametres.keys() != regles.keys() or not all(map(_texte_valide, parametres.values())):
+        if parametres.keys() != regles.keys():
             return _bloquer("parametres_invalides")
-        if any(valeurs is not None and parametres[champ] not in valeurs for champ, valeurs in regles.items()):
-            return _bloquer("hors_mission")
+        chemins_valides = {}
+        for champ, regle in regles.items():
+            valeur = parametres[champ]
+            limite = TAILLE_CONTENU_MAX if regle is DonneesOutil.CONTENU else TAILLE_TEXTE_MAX
+            if not _texte_valide(valeur, limite=limite):
+                return _bloquer("parametres_invalides")
+            if isinstance(regle, frozenset) and valeur not in regle:
+                return _bloquer("hors_mission")
+            if isinstance(regle, AccesTravail):
+                if self._travail is None:
+                    return _bloquer("perimetre_travail_absent")
+                chemin = self._travail.chemin_autorise(self._racine, valeur, regle)
+                if chemin is None:
+                    return _bloquer("hors_perimetre_travail")
+                chemins_valides[champ] = str(chemin)
 
         suppression = action in ACTIONS_SUPPRESSION
         textes_raisonnement = [_normaliser(intention)]
@@ -358,7 +398,7 @@ class GardeIA:
                 return _bloquer("raisonnement_manquant")
             cibles = {
                 champ: valeur for champ, valeur in parametres.items()
-                if regles[champ] is not None or suppression
+                if isinstance(regles[champ], (frozenset, AccesTravail)) or suppression
             }
             if raisonnement["action"] != action or raisonnement["cibles"] != cibles:
                 return _bloquer("raisonnement_incoherent")
@@ -384,6 +424,7 @@ class GardeIA:
                 return _bloquer("chemin_suppression_invalide")
             parametres["chemin"] = chemin
             autorisation_suppression = (action, chemin)
+        parametres.update(chemins_valides)
         return _Appel(action, outil, parametres, autorisation_suppression)
 
     def _refuser_ordre(self, ordre: Ordre, refus: dict[str, object]) -> dict[str, object]:
@@ -586,6 +627,17 @@ def creer_garde_notes(
     }, demande_utilisateur=demande_utilisateur, chemins_proteges=chemins_proteges, rapport=rapport)
 
 
+def creer_garde_travail(
+    politique: dict, *, racine_travail: Path, portee_travail: PorteeTravail | None,
+    chemins_proteges: tuple[Path | str, ...] = (), rapport: Path | str | None = None,
+) -> GardeIA:
+    return GardeIA(politique, {
+        "lire_fichier": lire_fichier,
+        "ecrire_fichier": ecrire_fichier,
+        "repondre": lambda texte: texte,
+    }, racine_travail=racine_travail, portee_travail=portee_travail, chemins_proteges=chemins_proteges, rapport=rapport)
+
+
 def _demonstration(garde: GardeIA) -> None:
     plan_ecriture = {
         "action": "ecrire_note",
@@ -669,17 +721,33 @@ def main() -> None:
     parser.add_argument("--demande", help="demande utilisateur originale pour une suppression avec --mission")
     parser.add_argument("--hote", action="store_true", help="accepter les événements du programme hôte avec --mission")
     parser.add_argument("--rapport", type=Path, help="enregistrer le rapport d’arrêt d’urgence à ce chemin")
+    parser.add_argument("--racine-travail", type=Path, help="espace de travail pour les outils de fichiers")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--fichier-actif", type=Path, help="fichier sélectionné par l’utilisateur")
+    selection.add_argument("--projet-actif", type=Path, help="dossier de projet sélectionné par l’utilisateur")
     options = parser.parse_args()
     if options.demo and options.demande is not None:
         parser.error("L’option --demande s’utilise avec --mission.")
     if options.demo and options.hote:
         parser.error("L’option --hote s’utilise avec --mission.")
+    if options.demo and options.racine_travail is not None:
+        parser.error("L’option --racine-travail s’utilise avec --mission.")
+    if options.racine_travail is None and (options.fichier_actif is not None or options.projet_actif is not None):
+        parser.error("La sélection de travail exige une --racine-travail.")
 
     chemin = Path(__file__).with_name("mission.exemple.json") if options.demo else options.mission
     demande = DEMANDE_DEMO if options.demo else options.demande
     try:
         politique = json.loads(chemin.read_text(encoding="utf-8-sig"), object_pairs_hook=_objet_json)
-        garde = creer_garde_notes(politique, demande_utilisateur=demande, chemins_proteges=(chemin,), rapport=options.rapport)
+        proteges = (chemin.resolve(),)
+        if options.racine_travail is not None:
+            portee = portee_depuis_demande(demande, fichier_actif=options.fichier_actif, projet_actif=options.projet_actif)
+            garde = creer_garde_travail(
+                politique, racine_travail=options.racine_travail, portee_travail=portee, chemins_proteges=proteges,
+                rapport=options.rapport,
+            )
+        else:
+            garde = creer_garde_notes(politique, demande_utilisateur=demande, chemins_proteges=proteges, rapport=options.rapport)
     except (OSError, ValueError, RecursionError) as erreur:
         parser.error(f"Mission invalide. {erreur}")
 

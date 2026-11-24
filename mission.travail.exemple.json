@@ -1,0 +1,8 @@
+{
+  "actions": {
+    "lire_fichier": {"chemin": {"travail": "lecture"}},
+    "ecrire_fichier": {"chemin": {"travail": "ecriture"}, "contenu": {"donnees": "contenu"}},
+    "repondre": {"texte": null}
+  },
+  "termes_bloques": ["exfiltrer", "voler des identifiants", "menace de mort"]
+}

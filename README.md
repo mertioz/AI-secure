@@ -1,6 +1,8 @@
-# AI Secure v0.4.0
+# AI Secure v0.4.01
 
 AI Secure contrôle les actions d’un agent avant qu’elles atteignent un outil. La politique confiée à la garde fixe les permissions. Chaque décision repose sur l’action demandée et les paramètres qui seront réellement transmis.
+
+Chaque mise à jour incrémente le dernier composant de la version, affiché sur au moins deux chiffres. La séquence continue avec `0.4.02`, puis `0.4.03`.
 
 ## Licence
 
@@ -45,7 +47,7 @@ La clôture refuse les nouveaux appels. Le banc lit les événements de réponse
 
 Dans `mission.exemple.json`, `actions` donne les outils autorisés et leurs paramètres obligatoires. Une liste impose des valeurs exactes. `null` accepte un texte libre de 4 096 caractères maximum, par exemple le corps d’un brouillon. Utilisez des valeurs exactes pour les identifiants de ressources. `termes_bloques` contient les mots et expressions à repérer. La recherche tient compte des mots entiers et ignore les différences d’accents, de casse et de ponctuation entre les mots.
 
-Le mode `--mission` lit une proposition JSON UTF-8 par ligne, jusqu’à 128 Kio par ligne, et produit une décision JSON par ligne. La lecture et l’écriture partagent les notes de la session en cours.
+Le mode `--mission` lit une proposition JSON UTF-8 par ligne, jusqu’à 1 Mio par ligne, et produit une décision JSON par ligne. La lecture et l’écriture partagent les notes de la session en cours.
 
 ```powershell
 @'
@@ -55,6 +57,24 @@ Le mode `--mission` lit une proposition JSON UTF-8 par ligne, jusqu’à 128 Kio
 ```
 
 Une décision `bloquee` donne le motif du refus et, le cas échéant, les termes repérés. Une décision `autorisee` contient le résultat de l’outil. Le statut `erreur` indique qu’un outil a été appelé puis a échoué.
+
+## Créer, réparer ou améliorer dans le périmètre de travail
+
+Une demande directe comme « Crée un programme dans ce fichier » ou « Répare-moi ce programme » autorise les écritures pour la cible que l’utilisateur a sélectionnée. L’hôte transmet le fichier ou le dossier de projet actif. Une sélection de projet permet de modifier les sources et d’ajouter les fichiers associés, comme des tests, à l’intérieur de ce dossier. Une demande de lecture peut donner accès aux fichiers de la sélection en lecture seule.
+
+Utilisez la politique de fichiers fournie avec une racine de travail et un fichier actif. Dans cet exemple, la garde peut enregistrer le contenu dans `calcul.py` sous la racine indiquée.
+
+```powershell
+@'
+{"action":"ecrire_fichier","parametres":{"chemin":"calcul.py","contenu":"def aire(x, y):\n    return x * y\n"}}
+'@ | python .\garde_ia.py --mission .\mission.travail.exemple.json --racine-travail .\espace-travail --fichier-actif calcul.py --demande 'Crée un programme dans ce fichier.'
+```
+
+`--projet-actif` sélectionne un dossier. Une demande comme `Améliore le document « brouillon.md »` peut aussi nommer directement la cible. Pour les tâches métier ou les demandes plus complexes, l’hôte peut fournir un objet `PorteeTravail` construit à partir des cibles autorisées. Cette interface sert aussi à travailler sur des tableaux, de la documentation ou d’autres fichiers.
+
+Dans les règles d’un outil de fichiers, `{"travail":"lecture"}` et `{"travail":"ecriture"}` valident la cible réelle dans le périmètre de la mission. L’outil reçoit le chemin absolu validé. `{"donnees":"contenu"}` accepte jusqu’à 65 536 caractères à écrire comme données, par exemple du code, en exigeant une cible d’écriture approuvée. Les suppressions et l’exécution de commandes conservent leurs autorisations propres. Les cibles hors périmètre sont refusées et les tentatives de modification de la garde suspendent la mission.
+
+Un essai local avec Qwen3-1.7B a réparé un calcul dans le fichier sélectionné. La garde a refusé l’écriture demandée sur le fichier voisin.
 
 ## Autoriser une suppression
 
