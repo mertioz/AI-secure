@@ -1,0 +1,27 @@
+{
+  "actions": {
+    "lire_note": {"note": ["mission"]},
+    "ecrire_note": {"note": ["mission"], "texte": null},
+    "repondre": {"texte": null},
+    "supprimer_fichier": {"chemin": null},
+    "supprimer_dossier": {"chemin": null}
+  },
+  "termes_bloques": [
+    "DDoS",
+    "exfiltrer",
+    "exfiltration",
+    "lancer une attaque",
+    "voler des identifiants",
+    "voler des mots de passe",
+    "steal credentials",
+    "contourner l’authentification",
+    "bypass authentication",
+    "rançongiciel",
+    "ransomware",
+    "menace de mort",
+    "death threat",
+    "je vais te tuer",
+    "je vais vous tuer",
+    "i will kill you"
+  ]
+}
