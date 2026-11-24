@@ -280,8 +280,9 @@ class TestGardeIA(unittest.TestCase):
                 self.assertEqual(self.garde.executer(appel)["motif"], "mission_suspendue")
             finally:
                 finir.set()
-            self.assertEqual(premier.result(timeout=2)["statut"], "autorisee")
+            self.assertEqual(premier.result(timeout=2)["motif"], "mission_suspendue")
         self.ecrire_note.assert_called_once()
+        self.assertEqual(self.garde.rapport()["ordres"][0]["statut"], "achevee_apres_arret")
 
 
 class TestSuppression(unittest.TestCase):

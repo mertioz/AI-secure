@@ -1,4 +1,4 @@
-# AI Secure v0.3.0
+# AI Secure v0.4.0
 
 AI Secure contrôle les actions d’un agent avant qu’elles atteignent un outil. La politique confiée à la garde fixe les permissions. Chaque décision repose sur l’action demandée et les paramètres qui seront réellement transmis.
 
@@ -28,7 +28,7 @@ L’hôte surveille directement le flux que le moteur expose. Un flux de réflex
 
 Le programme hôte appelle `garde.observer(fragment, canal=..., nouveau=...)` au fil des événements qu’il reçoit de son moteur, avant de transmettre des résultats d’outils ou d’afficher une réponse. Les canaux `raisonnement`, `donnees` et `reponse` gardent chacun les derniers caractères du flux pour repérer une expression répartie sur plusieurs fragments. `nouveau=True` ouvre un bloc indépendant, par exemple un autre document ou un nouveau message du modèle.
 
-Une instruction injectée suspend la mission. L’état indique le motif et le canal, chaque appel suivant est refusé et l’hôte peut arrêter la génération dès la décision. Il peut aussi annuler un outil déjà lancé si cet outil accepte l’annulation. Pour un document, analysez le contenu avant de le transmettre au modèle. Pour une réponse, validez le bloc avant de l’afficher.
+Une instruction injectée suspend la mission. L’état indique le motif et le canal, et chaque appel suivant est refusé. La suspension déclenche l’arrêt des travaux suivis et de l’agent raccordé. Pour un document, analysez le contenu avant de le transmettre au modèle. Pour une réponse, validez le bloc avant de l’afficher.
 
 ```python
 decision = garde.observer(fragment, canal="raisonnement", nouveau=premier_fragment)
@@ -87,7 +87,29 @@ Tout moteur peut être raccordé par un hôte qui traduit ses actions en appels 
 '@ | python .\garde_ia.py --mission .\mission.exemple.json --hote
 ```
 
-`fragment` transmet un texte reçu du moteur ou d’un outil, `appel` demande une exécution et `fin` clôture la mission. Un modèle qui fournit uniquement des propositions d’actions peut être utilisé avec les événements `appel` et les contrôles des données effectués par l’hôte.
+`fragment` transmet du texte reçu du moteur ou d’un outil, `appel` demande une exécution et `fin` clôture la mission. L’hôte peut transmettre `planifier` avec `proposition` et `dans` en secondes, demander `rapport` ou signaler un incident d’intégrité avec `sabotage`. Un modèle qui fournit uniquement des propositions d’actions peut être utilisé avec les événements `appel` et les contrôles des données effectués par l’hôte.
+
+## Autoriser une action nécessaire au travail
+
+L’hôte peut autoriser `connecter_wifi` dans la politique avec une liste de profils approuvés. Il fournit `ContexteReseau(internet_necessaire, est_en_ligne)` à la garde. Celle-ci laisse passer la reconnexion lorsque la mission a besoin d’internet, que la connexion manque et que le profil est approuvé. L’état réseau provient de la sonde de l’hôte. Pour un autre prérequis, `conditions` associe une action autorisée à une fonction qui évalue son contexte réel. Une absence de besoin ou un refus de contexte laisse la mission active.
+
+Une action planifiée est vérifiée de nouveau à son départ. Si la connexion a déjà été rétablie, la commande planifiée de reconnexion devient inutile et la garde refuse son exécution.
+
+## Arrêter la mission en cas de sabotage
+
+La garde protège ses fichiers et les chemins déclarés dans `chemins_proteges`, y compris un fichier de politique ou de rapport. Une demande de suppression ou de modification qui vise un élément protégé suspend la mission avant l’appel à l’outil. `racine_travail` indique où résoudre les chemins relatifs et `mutations` décrit les paramètres cibles des outils d’écriture supplémentaires.
+
+À la détection, la garde ferme l’accès aux outils, annule les départs planifiés et envoie en parallèle les demandes d’arrêt à l’agent et aux travaux en cours qu’elle supervise. L’hôte raccorde l’arrêt du moteur avec `arreter_agent` et celui des outils longs avec `OutilSupervise`. `commande_fixe` lance une commande prédéfinie par l’hôte et peut arrêter son groupe de processus. Les actions de terminal reconnues exigent des paramètres approuvés et un arrêt raccordé. Sous Windows, les processus associés au même objet de travail sont interrompus ensemble. [Objets de travail Windows](https://learn.microsoft.com/en-US/windows/win32/procthread/job-objects)
+
+L’hôte conserve la garde et son journal hors des droits de l’agent. Il place les appels réels et les tâches prévues sous la même supervision, via `executer` et `planifier`. Le rapport JSON donne les actions reçues, leurs cibles, leurs horaires, les refus et les états d’exécution, d’annulation ou d’arrêt. Il indique les arrêts que l’hôte a confirmés et ceux qui restent à confirmer.
+
+```powershell
+python -B .\demo_supervision.py --rapport .\banc-resultats\supervision\rapport.json
+```
+
+La démo simule une reconnexion nécessaire puis l’arrêt d’un processus agent et d’un travail en cours. Les processus sont réels et le rapport confirme aussi l’annulation du travail prévu. Dans le mode terminal, `--rapport` indique où écrire le rapport en cas de suspension.
+
+Le banc OSIA confirme l’arrêt de la session agent à la suspension et écrit `rapport-arret.json` dans le dossier de l’essai. Les essais GPT et DeepSeek avec l’annexe injectée ont confirmé l’arrêt et le refus de l’appel suivant.
 
 ## Tester des missions longues avec OSIA
 

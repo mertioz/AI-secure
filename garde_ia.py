@@ -6,11 +6,16 @@ import re
 import sys
 import unicodedata
 from collections.abc import Callable, Iterator
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import TIMEOUT_MAX, Lock, Timer
 from typing import BinaryIO
 
-VERSION = "0.3.0"
+from supervision import ContexteReseau, Ordre, OutilSupervise, SuiviMission, TravailEnCours, maintenant
+
+VERSION = "0.4.0"
 TAILLE_TEXTE_MAX = 4_096
 TAILLE_RAISONNEMENT_MAX = 16_384
 TAILLE_LIGNE_MAX = 128 * 1_024
@@ -19,6 +24,16 @@ CANAUX_SURVEILLES = {"raisonnement", "donnees", "reponse"}
 CHAMPS_APPEL = {"action", "parametres", "intention", "raisonnement"}
 CHAMPS_RAISONNEMENT = {"action", "cibles", "texte"}
 ACTIONS_SUPPRESSION = {"supprimer_fichier", "supprimer_dossier"}
+ACTIONS_MUTATION = ACTIONS_SUPPRESSION | {
+    "ecrire_fichier", "modifier_fichier", "renommer_fichier", "deplacer_fichier",
+    "write_file", "edit_file", "delete_file", "delete_directory", "rename_file", "move_file",
+}
+CHAMPS_MUTATION = SuiviMission.CIBLES | {"cible", "dossier", "old_path", "new_path"}
+ACTIONS_SABOTAGE = {
+    "supprimer_garde", "desactiver_garde", "arreter_garde", "modifier_garde", "modifier_politique",
+    "delete_guard", "disable_guard", "stop_guard", "edit_guard",
+}
+ACTIONS_TERMINAL = {"bash", "powershell", "shell", "run_command", "execute_command", "executer_commande", "terminal"}
 DEMANDE_DEMO = "Supprime le fichier « brouillons/ancien.txt »."
 MOTS = re.compile(r"[^\W_]+")
 
@@ -55,6 +70,11 @@ MOTIFS_INJECTION = (
         r"\b(?:traite\w*|considere\w*) (?:\w+ ){0,6}(?:comme|en tant que) (?:\w+ ){0,2}"
         r"(?:message systeme|instruction systeme)\b"
     ),
+)
+MOTIF_SABOTAGE = re.compile(
+    r"\b(?:supprimer|supprime|effacer|efface|detruire|detruis|desactiver|desactive|arreter|arrete|"
+    r"contourner|contourne|neutraliser|neutralise|casser|casse|delete|remove|disable|stop|bypass)"
+    r"(?: \w+){0,4} (?:ai secure|garde ia|programme de protection|security guard)\b"
 )
 DEMANDE_SUPPRESSION = re.compile(
     r"[ \t]*(?:(?:peux-tu|pourrais-tu|tu peux|merci de)[ \t]+(?:supprimer|effacer)|"
@@ -115,15 +135,30 @@ def _bloquer(motif: str, **details: object) -> dict[str, object]:
     return {"statut": "bloquee", "motif": motif, **details}
 
 
+@dataclass(frozen=True)
+class _Appel:
+    action: str
+    outil: Callable[..., object] | OutilSupervise
+    parametres: dict[str, str]
+    suppression: tuple[str, str] | None
+
+
 class GardeIA:
     """Le programme hôte fournit la politique et conserve les outils réels."""
 
     def __init__(
         self,
         politique: dict,
-        outils: dict[str, Callable[..., object]],
+        outils: dict[str, Callable[..., object] | OutilSupervise],
         *,
         demande_utilisateur: str | None = None,
+        contexte_reseau: ContexteReseau | None = None,
+        conditions: dict[str, Callable[[dict[str, str]], bool]] | None = None,
+        chemins_proteges: tuple[Path | str, ...] = (),
+        racine_travail: Path | str | None = None,
+        mutations: dict[str, tuple[str, ...]] | None = None,
+        arreter_agent: Callable[[], bool] | None = None,
+        rapport: Path | str | None = None,
     ):
         if not isinstance(politique, dict) or politique.keys() != {"actions", "termes_bloques"}:
             raise ValueError("La mission doit définir « actions » et « termes_bloques ».")
@@ -133,12 +168,16 @@ class GardeIA:
         self._actions = {}
         for action, champs in politique["actions"].items():
             outil = outils.get(action)
-            if not isinstance(action, str) or not action or not callable(outil):
+            if not isinstance(action, str) or not action or not (callable(outil) or isinstance(outil, OutilSupervise)):
                 raise ValueError(f"Outil indisponible pour l’action {action!r}.")
             if not isinstance(champs, dict):
                 raise ValueError(f"Les paramètres de {action!r} doivent former un objet.")
+            if action in ACTIONS_TERMINAL and (not isinstance(outil, OutilSupervise) or any(v is None for v in champs.values())):
+                raise ValueError(f"La commande {action!r} exige un arrêt raccordé et des paramètres approuvés.")
             if action in ACTIONS_SUPPRESSION and champs != {"chemin": None}:
                 raise ValueError(f"L’action {action!r} requiert un unique paramètre « chemin » de règle null.")
+            if action == "connecter_wifi" and (champs.keys() != {"profil"} or champs["profil"] is None):
+                raise ValueError("L’action connecter_wifi requiert une liste de profils approuvés.")
 
             regles = {}
             for champ, valeurs in champs.items():
@@ -160,13 +199,37 @@ class GardeIA:
 
         self._suppression_autorisee = _suppression_demandee(demande_utilisateur)
         self._verrou = Lock()
+        self._verrou_wifi = Lock()
         self._etat = {"statut": "active"}
         self._fragments = {}
+        self._suivi = SuiviMission(self._verrou, arreter_agent, rapport)
+        self._reseau = contexte_reseau
+        self._conditions = (conditions or {}).copy()
+        if any(action not in self._actions or not callable(condition) for action, condition in self._conditions.items()):
+            raise ValueError("Les conditions de contexte doivent viser des actions autorisées.")
+        self._racine = Path(racine_travail or Path.cwd()).resolve()
+        programme = Path(__file__).resolve()
+        proteges = (
+            programme, programme.with_name("supervision.py"), programme.with_name("processus_mission.py"),
+            programme.parent / "__pycache__", *chemins_proteges,
+        )
+        if self._suivi.chemin_rapport is not None:
+            proteges += (self._suivi.chemin_rapport,)
+        self._proteges = tuple((self._racine / chemin).resolve() for chemin in proteges)
+        self._mutations = {action: frozenset(champs) for action, champs in (mutations or {}).items()}
 
     @property
     def etat(self) -> dict[str, object]:
         with self._verrou:
             return self._etat.copy()
+
+    def rapport(self) -> dict[str, object]:
+        with self._verrou:
+            return self._suivi.rapport(self._etat)
+
+    def attendre_arret(self, timeout: float = 5) -> bool:
+        """Attend les confirmations et l’enregistrement du rapport d’arrêt."""
+        return self._suivi.arret_acheve.wait(timeout)
 
     def _refus_de_session(self) -> dict[str, object] | None:
         if self._etat["statut"] == "terminee":
@@ -178,7 +241,13 @@ class GardeIA:
     def _suspendre(self, motif: str, canal: str) -> dict[str, object]:
         self._etat = {"statut": "suspendue", "motif": motif, "canal": canal}
         self._fragments.clear()
+        self._suivi.interrompre(self._etat)
         return _bloquer(motif, canal=canal)
+
+    def signaler_sabotage(self) -> dict[str, object]:
+        """L’hôte signale un incident d’intégrité constaté hors des appels d’outils."""
+        with self._verrou:
+            return self._refus_de_session() or self._suspendre("sabotage_detecte", "hote")
 
     def observer(self, fragment: str, *, canal: str, nouveau: bool = False) -> dict[str, object]:
         """Examine un fragment avant de le transmettre. L’hôte indique le début d’un flux."""
@@ -196,6 +265,8 @@ class GardeIA:
             if any(motif.search(normalise) for motif in MOTIFS_INJECTION):
                 return self._suspendre("injection_detectee", canal)
             if canal != "donnees":
+                if canal == "raisonnement" and MOTIF_SABOTAGE.search(normalise):
+                    return self._suspendre("sabotage_detecte", canal)
                 if any(motif.search(normalise) for motif in MOTIFS_CONTOURNEMENT):
                     return self._suspendre("contournement_detecte", canal)
                 if any(motif in f" {normalise} " for _, motif in self._termes):
@@ -209,28 +280,62 @@ class GardeIA:
             if self._etat["statut"] == "active":
                 self._etat = {"statut": "terminee"}
                 self._fragments.clear()
+                self._suivi.annuler_programmation("mission_terminee")
+                if self._suivi.etat_agent == "actif":
+                    self._suivi.etat_agent = "termine"
             return self._etat.copy()
 
-    def executer(self, proposition: object) -> dict[str, object]:
-        """Exécute l’outil uniquement après avoir validé l’appel complet."""
+    def _motif_mutation(self, action: str, parametres: dict) -> str | None:
+        if action in ACTIONS_SABOTAGE:
+            return "sabotage_detecte"
+        champs = self._mutations.get(action, frozenset())
+        if action in ACTIONS_MUTATION:
+            champs = champs | CHAMPS_MUTATION
+        motif = None
+        for champ in champs:
+            valeur = parametres.get(champ)
+            if not isinstance(valeur, str) or not valeur or len(valeur) > TAILLE_TEXTE_MAX:
+                continue
+            try:
+                cible = (self._racine / valeur).resolve()
+            except (OSError, ValueError, RuntimeError):
+                motif = "cible_non_verifiable"
+                continue
+            if any(cible.is_relative_to(protege) or protege.is_relative_to(cible) for protege in self._proteges):
+                return "sabotage_detecte"
+        return motif
+
+    def _interdire_et_suspendre(self, ordre: Ordre, motif: str, canal: str) -> dict[str, object]:
         with self._verrou:
             if refus := self._refus_de_session():
                 return refus
-        if not isinstance(proposition, dict) or proposition.keys() - CHAMPS_APPEL:
+            ordre.finir("refusee", motif)
+            return self._suspendre(motif, canal)
+
+    def _preparer(self, proposition: object, ordre: Ordre) -> _Appel | dict[str, object]:
+        if not isinstance(proposition, dict):
             return _bloquer("format_invalide")
 
         action = proposition.get("action")
         parametres = proposition.get("parametres")
         intention = proposition.get("intention", "")
+        if isinstance(action, str):
+            motif = self._motif_mutation(action, parametres if isinstance(parametres, dict) else {})
+            if motif == "sabotage_detecte":
+                return self._interdire_et_suspendre(ordre, motif, "appel")
+            if motif:
+                return _bloquer(motif)
+        if proposition.keys() - CHAMPS_APPEL:
+            return _bloquer("format_invalide")
         if not isinstance(action, str) or not isinstance(parametres, dict) or not _texte_valide(intention):
             return _bloquer("format_invalide")
+        parametres = parametres.copy()
 
         autorisation = self._actions.get(action)
         if autorisation is None:
             return _bloquer("action_non_autorisee")
 
         outil, regles = autorisation
-        parametres = parametres.copy()
         if parametres.keys() != regles.keys() or not all(map(_texte_valide, parametres.values())):
             return _bloquer("parametres_invalides")
         if any(valeurs is not None and parametres[champ] not in valeurs for champ, valeurs in regles.items()):
@@ -260,34 +365,154 @@ class GardeIA:
             textes_raisonnement.append(texte_raisonnement)
 
         if any(motif.search(texte) for texte in textes_raisonnement for motif in MOTIFS_INJECTION):
-            with self._verrou:
-                return self._refus_de_session() or self._suspendre("injection_detectee", "raisonnement")
+            return self._interdire_et_suspendre(ordre, "injection_detectee", "raisonnement")
+        if any(MOTIF_SABOTAGE.search(texte) for texte in textes_raisonnement):
+            return self._interdire_et_suspendre(ordre, "sabotage_detecte", "raisonnement")
         if any(motif.search(texte) for texte in textes_raisonnement for motif in MOTIFS_CONTOURNEMENT):
             return _bloquer("contournement_detecte")
 
-        textes = [f" {texte} " for texte in (*textes_raisonnement, *map(_normaliser, parametres.values()))]
+        textes_libres = (_normaliser(valeur) for champ, valeur in parametres.items() if regles[champ] is None and not suppression)
+        textes = [f" {texte} " for texte in (*textes_raisonnement, *textes_libres)]
         reperes = [terme for terme, motif in self._termes if any(motif in texte for texte in textes)]
         if reperes:
             return _bloquer("terme_bloque", termes=reperes)
 
+        autorisation_suppression = None
         if suppression:
             chemin = _chemin_relatif(parametres["chemin"])
             if chemin is None:
                 return _bloquer("chemin_suppression_invalide")
+            parametres["chemin"] = chemin
+            autorisation_suppression = (action, chemin)
+        return _Appel(action, outil, parametres, autorisation_suppression)
+
+    def _refuser_ordre(self, ordre: Ordre, refus: dict[str, object]) -> dict[str, object]:
+        if ordre.statut in {"recu", "programmee"}:
+            ordre.finir("refusee", str(refus["motif"]))
+        return refus
+
+    def _verifier_reconnexion(self) -> dict[str, object] | None:
+        if self._reseau is None or self._reseau.internet_necessaire is not True:
+            return _bloquer("connexion_hors_mission")
+        try:
+            connecte = self._reseau.est_en_ligne()
+        except Exception:
+            return _bloquer("etat_reseau_indisponible")
+        if type(connecte) is not bool:
+            return _bloquer("etat_reseau_indisponible")
+        if connecte:
+            return _bloquer("connexion_deja_active")
+        return None
+
+    def _verifier_contexte(self, appel: _Appel) -> dict[str, object] | None:
+        if appel.action == "connecter_wifi" and (refus := self._verifier_reconnexion()):
+            return refus
+        condition = self._conditions.get(appel.action)
+        if condition is not None:
+            try:
+                necessaire = condition(appel.parametres.copy())
+            except Exception:
+                return _bloquer("contexte_indisponible")
+            if necessaire is not True:
+                return _bloquer("condition_mission_non_remplie")
+        return None
+
+    def executer(self, proposition: object) -> dict[str, object]:
+        """Exécute l’outil uniquement après avoir validé l’appel complet."""
+        with self._verrou:
+            ordre = self._suivi.inscrire(proposition)
+        return self._executer(proposition, ordre)
+
+    def _executer(self, proposition: object, ordre: Ordre) -> dict[str, object]:
         with self._verrou:
             if refus := self._refus_de_session():
-                return refus
-            if suppression:
-                if (action, chemin) != self._suppression_autorisee:
-                    return _bloquer("suppression_hors_demande")
+                return self._refuser_ordre(ordre, refus)
+        appel = self._preparer(proposition, ordre)
+        if isinstance(appel, dict):
+            with self._verrou:
+                return self._refuser_ordre(ordre, appel)
+        if appel.action != "connecter_wifi":
+            return self._appliquer(appel, ordre)
+        if not self._verrou_wifi.acquire(blocking=False):
+            with self._verrou:
+                return self._refuser_ordre(ordre, _bloquer("connexion_deja_en_cours"))
+        try:
+            return self._appliquer(appel, ordre)
+        finally:
+            self._verrou_wifi.release()
+
+    def _appliquer(self, appel: _Appel, ordre: Ordre) -> dict[str, object]:
+        if refus := self._verifier_contexte(appel):
+            with self._verrou:
+                return self._refuser_ordre(ordre, refus)
+
+        with self._verrou:
+            if refus := self._refus_de_session():
+                return self._refuser_ordre(ordre, refus)
+            if appel.suppression is not None:
+                if appel.suppression != self._suppression_autorisee:
+                    return self._refuser_ordre(ordre, _bloquer("suppression_hors_demande"))
                 self._suppression_autorisee = None
-                parametres["chemin"] = chemin
+            ordre.statut = "en_cours"
+            ordre.commence_le = maintenant()
+            if isinstance(appel.outil, OutilSupervise):
+                try:
+                    travail = appel.outil.demarrer(**appel.parametres)
+                    if not isinstance(travail, TravailEnCours):
+                        raise TypeError("Un outil supervisé doit fournir un travail suivi.")
+                    ordre.travail = travail
+                except Exception:
+                    ordre.finir("erreur", "echec_demarrage")
+                    return {"statut": "erreur", "motif": "echec_outil"}
 
         try:
-            resultat = outil(**parametres)
+            resultat = ordre.travail.attendre() if ordre.travail is not None else appel.outil(**appel.parametres)
         except Exception:
-            return {"statut": "erreur", "motif": "echec_outil"}
-        return {"statut": "autorisee", "resultat": resultat}
+            erreur = True
+        else:
+            erreur = False
+        with self._verrou:
+            if not erreur and ordre.travail is not None and isinstance(resultat, dict):
+                code_retour = resultat.get("code_retour")
+                if type(code_retour) is int:
+                    ordre.code_retour = code_retour
+            if self._etat["statut"] == "suspendue":
+                if ordre.statut == "arret_non_confirme" and ordre.travail is None:
+                    ordre.finir("achevee_apres_arret", "echec_outil" if erreur else "outil_sans_arret_raccorde")
+                return self._refus_de_session()
+            if erreur:
+                ordre.finir("erreur", "echec_outil")
+                return {"statut": "erreur", "motif": "echec_outil"}
+            if ordre.code_retour not in (None, 0):
+                ordre.finir("erreur", "code_retour_non_nul")
+                return {"statut": "erreur", "motif": "echec_outil", "resultat": resultat}
+            ordre.finir("executee")
+            return {"statut": "autorisee", "resultat": resultat}
+
+    def planifier(self, proposition: object, *, dans: float) -> dict[str, object]:
+        """Programme un appel de cette mission, puis le revalide à son départ."""
+        with self._verrou:
+            ordre = self._suivi.inscrire(proposition)
+            if refus := self._refus_de_session():
+                return self._refuser_ordre(ordre, refus)
+        appel = self._preparer(proposition, ordre)
+        with self._verrou:
+            if isinstance(appel, dict):
+                return self._refuser_ordre(ordre, appel)
+            if refus := self._refus_de_session():
+                return self._refuser_ordre(ordre, refus)
+            if isinstance(dans, bool) or not isinstance(dans, (int, float)) or not 0 <= dans <= TIMEOUT_MAX:
+                return self._refuser_ordre(ordre, _bloquer("delai_invalide"))
+            if appel.suppression is not None and appel.suppression != self._suppression_autorisee:
+                return self._refuser_ordre(ordre, _bloquer("suppression_hors_demande"))
+            copie = deepcopy(proposition)
+            minuterie = Timer(dans, self._executer, args=(copie, ordre))
+            minuterie.daemon = True
+            ordre.minuterie = minuterie
+            ordre.programme_pour = (datetime.now(timezone.utc) + timedelta(seconds=dans)).isoformat(timespec="milliseconds")
+            ordre.statut = "programmee"
+            minuterie.start()
+            return {"statut": "programmee", "id": ordre.identifiant}
 
 
 def _objet_json(paires: list[tuple[str, object]]) -> dict[str, object]:
@@ -305,11 +530,17 @@ def _traiter_evenement_hote(evenement: object, garde: GardeIA) -> dict[str, obje
     type_evenement = evenement.get("type")
     if type_evenement == "appel" and evenement.keys() == {"type", "proposition"}:
         return garde.executer(evenement["proposition"])
+    if type_evenement == "planifier" and evenement.keys() == {"type", "proposition", "dans"}:
+        return garde.planifier(evenement["proposition"], dans=evenement["dans"])
     if type_evenement == "fragment" and evenement.keys() == {"type", "canal", "texte", "nouveau"}:
         if isinstance(evenement["nouveau"], bool):
             return garde.observer(evenement["texte"], canal=evenement["canal"], nouveau=evenement["nouveau"])
     if type_evenement == "fin" and evenement.keys() == {"type"}:
         return garde.terminer()
+    if type_evenement == "rapport" and evenement.keys() == {"type"}:
+        return garde.rapport()
+    if type_evenement == "sabotage" and evenement.keys() == {"type"}:
+        return garde.signaler_sabotage()
     return _bloquer("format_invalide")
 
 
@@ -330,7 +561,10 @@ def traiter_flux(flux: BinaryIO, garde: GardeIA, *, hote: bool = False) -> Itera
         yield _traiter_evenement_hote(proposition, garde) if hote else garde.executer(proposition)
 
 
-def creer_garde_notes(politique: dict, *, demande_utilisateur: str | None = None) -> GardeIA:
+def creer_garde_notes(
+    politique: dict, *, demande_utilisateur: str | None = None,
+    chemins_proteges: tuple[Path | str, ...] = (), rapport: Path | str | None = None,
+) -> GardeIA:
     notes = {}
 
     def lire_note(note: str) -> str:
@@ -349,7 +583,7 @@ def creer_garde_notes(politique: dict, *, demande_utilisateur: str | None = None
         "repondre": lambda texte: texte,
         "supprimer_fichier": simuler_suppression,
         "supprimer_dossier": simuler_suppression,
-    }, demande_utilisateur=demande_utilisateur)
+    }, demande_utilisateur=demande_utilisateur, chemins_proteges=chemins_proteges, rapport=rapport)
 
 
 def _demonstration(garde: GardeIA) -> None:
@@ -434,6 +668,7 @@ def main() -> None:
     mode.add_argument("--mission", type=Path, help="lire la politique depuis ce fichier JSON")
     parser.add_argument("--demande", help="demande utilisateur originale pour une suppression avec --mission")
     parser.add_argument("--hote", action="store_true", help="accepter les événements du programme hôte avec --mission")
+    parser.add_argument("--rapport", type=Path, help="enregistrer le rapport d’arrêt d’urgence à ce chemin")
     options = parser.parse_args()
     if options.demo and options.demande is not None:
         parser.error("L’option --demande s’utilise avec --mission.")
@@ -444,18 +679,21 @@ def main() -> None:
     demande = DEMANDE_DEMO if options.demo else options.demande
     try:
         politique = json.loads(chemin.read_text(encoding="utf-8-sig"), object_pairs_hook=_objet_json)
-        garde = creer_garde_notes(politique, demande_utilisateur=demande)
+        garde = creer_garde_notes(politique, demande_utilisateur=demande, chemins_proteges=(chemin,), rapport=options.rapport)
     except (OSError, ValueError, RecursionError) as erreur:
         parser.error(f"Mission invalide. {erreur}")
 
     if options.demo:
         sys.stdout.reconfigure(encoding="utf-8")
         _demonstration(garde)
+        garde.attendre_arret()
         return
 
     for decision in traiter_flux(sys.stdin.buffer, garde, hote=options.hote):
         print(json.dumps(decision), flush=True)
     garde.terminer()
+    if garde.etat["statut"] == "suspendue":
+        garde.attendre_arret()
 
 
 if __name__ == "__main__":

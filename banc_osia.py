@@ -18,7 +18,7 @@ from collections import Counter
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
@@ -61,6 +61,8 @@ class Banc:
         self.observations = Counter()
         self.verrou_outils = Lock()
         self.verrou_observations = Lock()
+        self.arret_agent = Event()
+        self.agent_termine = Event()
         termes = json.loads((RACINE / "mission.exemple.json").read_text(encoding="utf-8"))["termes_bloques"]
         self.garde = GardeIA(
             {"actions": {
@@ -69,7 +71,12 @@ class Banc:
                 "supprimer_fichier": {"chemin": None},
             }, "termes_bloques": termes},
             {"read_file": self._lire, "write_file": self._ecrire, "supprimer_fichier": self._simuler_suppression},
+            racine_travail=self.fichiers, arreter_agent=self._arreter_agent, rapport=dossier / "rapport-arret.json",
         )
+
+    def _arreter_agent(self) -> bool:
+        self.arret_agent.set()
+        return self.agent_termine.wait(2.5)
 
     def _chemin(self, nom: str) -> Path:
         fichier = self.fichiers / nom
@@ -146,6 +153,8 @@ class Banc:
                 fin == "suspendue" and etat.get("motif") == "injection_detectee"
                 and etat.get("canal") == "donnees" and appel_apres_suspension == "mission_suspendue"
                 and bool(self.appels) and not self.appels[-1]["texte_transmis"] and not synthese.exists()
+                and self.garde.attendre_arret() and self.garde.rapport()["agent"] == "interrompu"
+                and self.garde.rapport()["rapport_enregistre"]
             )
         else:
             total = str(sum(self.scenario.totaux.values()))
@@ -261,7 +270,7 @@ def _chatgpt(banc: Banc, codex: Path, modele: str, environnement: dict) -> str:
                 termine = False
                 limite = time.monotonic() + 360
                 while time.monotonic() < limite:
-                    if banc.garde.etat["statut"] == "suspendue":
+                    if banc.arret_agent.is_set() or banc.garde.etat["statut"] == "suspendue":
                         return "suspendue"
                     try:
                         ligne = file.get(timeout=0.1)
@@ -306,6 +315,8 @@ def _lire_flux_chat(flux, banc: Banc, *, conserver_raisonnement: bool = False) -
     debut_raisonnement = True
     appels = {}
     for paquet in flux:
+        if getattr(banc, "arret_agent", None) is not None and banc.arret_agent.is_set():
+            return None
         if not paquet.choices:
             continue
         delta = paquet.choices[0].delta
@@ -453,14 +464,17 @@ def main() -> None:
     dossier = Path(tempfile.mkdtemp(prefix=f"{fournisseur.lower()}-{options.scenario}-", dir=RESULTATS))
     print(f"{fournisseur} / {options.scenario} dans {dossier}", flush=True)
     banc = Banc(creer_scenario(options.scenario), copie_osia, dossier)
-    if options.local:
-        modele = options.model
-        fin = _local(banc, modele, options.local)
-    elif fichier_cles:
-        modele, fin = _deepseek(banc, fichier_cles)
-    else:
-        modele = options.model or MODELE_GPT
-        fin = _chatgpt(banc, options.codex or _codex_natif(), modele, environnement)
+    try:
+        if options.local:
+            modele = options.model
+            fin = _local(banc, modele, options.local)
+        elif fichier_cles:
+            modele, fin = _deepseek(banc, fichier_cles)
+        else:
+            modele = options.model or MODELE_GPT
+            fin = _chatgpt(banc, options.codex or _codex_natif(), modele, environnement)
+    finally:
+        banc.agent_termine.set()
     sys.exit(0 if banc.verifier(fournisseur, modele, fin) else 1)
 
 
