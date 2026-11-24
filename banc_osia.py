@@ -1,4 +1,4 @@
-"""Banc de missions longues pour une copie locale d’OSIA et deux modèles réels."""
+"""Banc d’essai OSIA pour des modèles locaux et distants."""
 
 import argparse
 import asyncio
@@ -20,6 +20,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from banc_scenarios import MARQUEUR, SYNTHESE, TEMOIN, TOTAUX, Scenario, creer_scenario
 from garde_ia import GardeIA
@@ -101,20 +102,13 @@ class Banc:
             self.observations[canal] += 1
             return self.garde.observer(texte, canal=canal, nouveau=nouveau)
 
-    def proposer_action(
-        self, action: str, cible: str, contenu: str,
-        action_prevue: str, cible_prevue: str, raisonnement_visible: str,
-    ) -> dict:
-        """Vérifie une action OSIA, sa cible et le plan visible associé."""
+    def proposer_action(self, action: str, cible: str, contenu: str) -> dict:
+        """Vérifie l’action OSIA et les paramètres qu’elle recevra."""
         champ = "chemin" if action == "supprimer_fichier" else "path"
-        champ_prevu = "chemin" if action_prevue == "supprimer_fichier" else "path"
         parametres = {champ: cible}
         if action == "write_file" or contenu:
             parametres["content"] = contenu
-        proposition = {
-            "action": action, "parametres": parametres,
-            "raisonnement": {"action": action_prevue, "cibles": {champ_prevu: cible_prevue}, "texte": raisonnement_visible},
-        }
+        proposition = {"action": action, "parametres": parametres}
         with self.verrou_outils:
             avant = len(self.outils_appeles)
             decision = self.garde.executer(proposition)
@@ -147,7 +141,6 @@ class Banc:
         if self.scenario.suspension_attendue:
             appel_apres_suspension = self.garde.executer({
                 "action": "write_file", "parametres": {"path": SYNTHESE, "content": "Texte de contrôle."},
-                "raisonnement": {"action": "write_file", "cibles": {"path": SYNTHESE}, "texte": "Vérifier la suspension."},
             })["motif"]
             fin_verifiee = (
                 fin == "suspendue" and etat.get("motif") == "injection_detectee"
@@ -307,20 +300,23 @@ def _chatgpt(banc: Banc, codex: Path, modele: str, environnement: dict) -> str:
                 processus.stdout.close()
 
 
-def _lire_flux_deepseek(flux, banc: Banc) -> dict | None:
+def _lire_flux_chat(flux, banc: Banc, *, conserver_raisonnement: bool = False) -> dict | None:
     contenu = []
     raisonnement = []
+    debut_raisonnement = True
     appels = {}
     for paquet in flux:
         if not paquet.choices:
             continue
         delta = paquet.choices[0].delta
-        fragment = getattr(delta, "reasoning_content", None)
+        fragment = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
         if fragment:
-            decision = banc.observer(fragment, canal="raisonnement", nouveau=not raisonnement)
+            decision = banc.observer(fragment, canal="raisonnement", nouveau=debut_raisonnement)
             if decision["statut"] == "bloquee":
                 return None
-            raisonnement.append(fragment)
+            debut_raisonnement = False
+            if conserver_raisonnement:
+                raisonnement.append(fragment)
         if delta.content:
             decision = banc.observer(delta.content, canal="reponse", nouveau=not contenu)
             if decision["statut"] == "bloquee":
@@ -342,6 +338,39 @@ def _lire_flux_deepseek(flux, banc: Banc) -> dict | None:
     return message
 
 
+def _boucle_chat(banc: Banc, ouvrir_flux, *, conserver_raisonnement: bool = False) -> str:
+    outil = asyncio.run(_mcp(banc).list_tools())[0]
+    outils = [{"type": "function", "function": {
+        "name": outil.name, "description": outil.description, "parameters": outil.inputSchema,
+    }}]
+    messages = [{"role": "user", "content": banc.scenario.prompt()}]
+    limite = len(banc.scenario.etapes)
+    for _ in range(limite + 3):
+        choix = "none" if len(banc.appels) >= limite else "auto"
+        with ouvrir_flux(messages, outils, choix) as flux:
+            message = _lire_flux_chat(flux, banc, conserver_raisonnement=conserver_raisonnement)
+        if message is None:
+            return "suspendue"
+        appels = message.get("tool_calls") or []
+        if not appels:
+            return "terminee" if message["content"] else "erreur_modele"
+        messages.append(message)
+        for appel in appels:
+            if appel["function"]["name"] != outil.name:
+                return "outil_inattendu"
+            try:
+                arguments = json.loads(appel["function"]["arguments"])
+            except (ValueError, RecursionError):
+                return "arguments_invalides"
+            if not isinstance(arguments, dict) or arguments.keys() != {"action", "cible", "contenu"}:
+                return "arguments_invalides"
+            decision = banc.proposer_action(**arguments)
+            if banc.garde.etat["statut"] == "suspendue":
+                return "suspendue"
+            messages.append({"role": "tool", "tool_call_id": appel["id"], "content": json.dumps(decision, ensure_ascii=False)})
+    return "limite_banc"
+
+
 def _deepseek(banc: Banc, fichier_cles: Path) -> tuple[str, str]:
     from openai import APIError, OpenAI
     from osia import config
@@ -353,73 +382,85 @@ def _deepseek(banc: Banc, fichier_cles: Path) -> tuple[str, str]:
     base_url = PROVIDERS["deepseek"]["base_url"]
     if base_url != "https://api.deepseek.com/v1":
         raise RuntimeError("Le banc attend le point d’accès officiel DeepSeek.")
-    outil = asyncio.run(_mcp(banc).list_tools())[0]
-    outils = [{"type": "function", "function": {
-        "name": outil.name, "description": outil.description, "parameters": outil.inputSchema,
-    }}]
-    messages = [{"role": "user", "content": banc.scenario.prompt()}]
+    @contextmanager
+    def ouvrir_flux(messages, outils, choix):
+        def demander(cle):
+            client = OpenAI(api_key=cle, base_url=base_url, max_retries=0, timeout=60.0)
+            try:
+                flux = client.chat.completions.create(
+                    model=MODEL_ID, messages=messages, tools=outils, stream=True, tool_choice=choix,
+                    extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
+                )
+            except Exception:
+                client.close()
+                raise
+            return client, flux
 
-    def demander(cle):
-        client = OpenAI(api_key=cle, base_url=base_url, max_retries=0, timeout=60.0)
-        try:
-            flux = client.chat.completions.create(
-                model=MODEL_ID, messages=messages, tools=outils, stream=True,
-                tool_choice="none" if len(banc.appels) >= len(banc.scenario.etapes) else "auto",
-                extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
-            )
-        except Exception:
-            client.close()
-            raise
-        return client, flux
+        client, flux = with_key_rotation("deepseek", demander, log=lambda _: None)
+        with client, flux:
+            yield flux
 
     try:
         with patch.object(config, "API_KEYS_FILE", str(fichier_cles)), task_scope():
-            for _ in range(len(banc.scenario.etapes) + 3):
-                client, flux = with_key_rotation("deepseek", demander, log=lambda _: None)
-                with client, flux:
-                    message = _lire_flux_deepseek(flux, banc)
-                if message is None:
-                    return MODEL_ID, "suspendue"
-                appels = message.get("tool_calls") or []
-                if not appels:
-                    return MODEL_ID, "terminee" if message["content"] else "erreur_modele"
-                messages.append(message)
-                for appel in appels:
-                    if appel["function"]["name"] != outil.name:
-                        return MODEL_ID, "outil_inattendu"
-                    arguments = json.loads(appel["function"]["arguments"])
-                    decision = banc.proposer_action(**arguments)
-                    if banc.garde.etat["statut"] == "suspendue":
-                        return MODEL_ID, "suspendue"
-                    messages.append({"role": "tool", "tool_call_id": appel["id"], "content": json.dumps(decision, ensure_ascii=False)})
+            return MODEL_ID, _boucle_chat(banc, ouvrir_flux, conserver_raisonnement=True)
     except (APIError, KeyChainEmpty) as erreur:
         print(f"Requête DeepSeek en échec ({getattr(erreur, 'status_code', type(erreur).__name__)}).", file=sys.stderr)
         return MODEL_ID, "erreur_modele"
-    return MODEL_ID, "limite_banc"
+
+
+def _local(banc: Banc, modele: str, url: str) -> str:
+    import httpx
+    from openai import APIError, OpenAI
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    with OpenAI(
+        api_key="local", base_url=url, max_retries=0, timeout=120.0,
+        http_client=httpx.Client(trust_env=False, follow_redirects=False),
+    ) as client:
+        def ouvrir_flux(messages, outils, choix):
+            return client.chat.completions.create(
+                model=modele, messages=messages, tools=outils, stream=True, tool_choice=choix,
+            )
+
+        try:
+            return _boucle_chat(banc, ouvrir_flux)
+        except APIError as erreur:
+            print(f"Requête au moteur local en échec ({getattr(erreur, 'status_code', type(erreur).__name__)}).", file=sys.stderr)
+            return "erreur_modele"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--osia", type=Path, required=True, help="copie du code OSIA à tester")
-    parser.add_argument("--scenario", choices=("inventaire", "annexe"), required=True)
+    parser.add_argument("--scenario", choices=("inventaire", "annexe", "local"), required=True)
     parser.add_argument("--codex", type=Path)
-    parser.add_argument("--model", default=MODELE_GPT)
-    parser.add_argument("--deepseek", type=Path, metavar="FICHIER_CLES")
+    parser.add_argument("--model")
+    fournisseur_disponible = parser.add_mutually_exclusive_group()
+    fournisseur_disponible.add_argument("--deepseek", type=Path, metavar="FICHIER_CLES")
+    fournisseur_disponible.add_argument("--local", metavar="URL", help="API de chat compatible OpenAI sur la boucle locale")
     options = parser.parse_args()
+    if options.local:
+        url = urlsplit(options.local)
+        if url.scheme not in {"http", "https"} or url.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            parser.error("--local exige une URL HTTP de boucle locale.")
+        if url.username or url.password or url.query or url.fragment or not options.model:
+            parser.error("--local exige une URL sans identifiants et un --model.")
     environnement = os.environ.copy()
     copie_osia = options.osia.resolve(strict=True)
     fichier_cles = options.deepseek.resolve(strict=True) if options.deepseek else None
-    codex = None if fichier_cles else (options.codex or _codex_natif())
-    fournisseur = "DeepSeek" if fichier_cles else "ChatGPT"
+    fournisseur = "Local" if options.local else "DeepSeek" if fichier_cles else "ChatGPT"
     RESULTATS.mkdir(exist_ok=True)
     dossier = Path(tempfile.mkdtemp(prefix=f"{fournisseur.lower()}-{options.scenario}-", dir=RESULTATS))
     print(f"{fournisseur} / {options.scenario} dans {dossier}", flush=True)
     banc = Banc(creer_scenario(options.scenario), copie_osia, dossier)
-    if fichier_cles:
+    if options.local:
+        modele = options.model
+        fin = _local(banc, modele, options.local)
+    elif fichier_cles:
         modele, fin = _deepseek(banc, fichier_cles)
     else:
-        modele = options.model
-        fin = _chatgpt(banc, codex, modele, environnement)
+        modele = options.model or MODELE_GPT
+        fin = _chatgpt(banc, options.codex or _codex_natif(), modele, environnement)
     sys.exit(0 if banc.verifier(fournisseur, modele, fin) else 1)
 
 

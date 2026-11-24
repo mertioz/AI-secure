@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Lock
 from typing import BinaryIO
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 TAILLE_TEXTE_MAX = 4_096
 TAILLE_RAISONNEMENT_MAX = 16_384
 TAILLE_LIGNE_MAX = 128 * 1_024
@@ -236,31 +236,29 @@ class GardeIA:
         if any(valeurs is not None and parametres[champ] not in valeurs for champ, valeurs in regles.items()):
             return _bloquer("hors_mission")
 
-        raisonnement = proposition.get("raisonnement")
-        if raisonnement is None:
-            return _bloquer("raisonnement_manquant")
-        if (
-            not isinstance(raisonnement, dict)
-            or raisonnement.keys() != CHAMPS_RAISONNEMENT
-            or not isinstance(raisonnement["action"], str)
-            or not isinstance(raisonnement["cibles"], dict)
-            or not _texte_valide(raisonnement["texte"], limite=TAILLE_RAISONNEMENT_MAX)
-        ):
-            return _bloquer("raisonnement_invalide")
-
-        texte_raisonnement = _normaliser(raisonnement["texte"])
-        if not texte_raisonnement:
-            return _bloquer("raisonnement_manquant")
-
         suppression = action in ACTIONS_SUPPRESSION
-        cibles = {
-            champ: valeur for champ, valeur in parametres.items()
-            if regles[champ] is not None or suppression
-        }
-        if raisonnement["action"] != action or raisonnement["cibles"] != cibles:
-            return _bloquer("raisonnement_incoherent")
+        textes_raisonnement = [_normaliser(intention)]
+        raisonnement = proposition.get("raisonnement")
+        if raisonnement is not None:
+            if (
+                not isinstance(raisonnement, dict)
+                or raisonnement.keys() != CHAMPS_RAISONNEMENT
+                or not isinstance(raisonnement["action"], str)
+                or not isinstance(raisonnement["cibles"], dict)
+                or not _texte_valide(raisonnement["texte"], limite=TAILLE_RAISONNEMENT_MAX)
+            ):
+                return _bloquer("raisonnement_invalide")
+            texte_raisonnement = _normaliser(raisonnement["texte"])
+            if not texte_raisonnement:
+                return _bloquer("raisonnement_manquant")
+            cibles = {
+                champ: valeur for champ, valeur in parametres.items()
+                if regles[champ] is not None or suppression
+            }
+            if raisonnement["action"] != action or raisonnement["cibles"] != cibles:
+                return _bloquer("raisonnement_incoherent")
+            textes_raisonnement.append(texte_raisonnement)
 
-        textes_raisonnement = (texte_raisonnement, _normaliser(intention))
         if any(motif.search(texte) for texte in textes_raisonnement for motif in MOTIFS_INJECTION):
             with self._verrou:
                 return self._refus_de_session() or self._suspendre("injection_detectee", "raisonnement")
@@ -301,8 +299,22 @@ def _objet_json(paires: list[tuple[str, object]]) -> dict[str, object]:
     return objet
 
 
-def traiter_flux(flux: BinaryIO, garde: GardeIA) -> Iterator[dict[str, object]]:
-    """Traite une proposition JSON UTF-8 par ligne."""
+def _traiter_evenement_hote(evenement: object, garde: GardeIA) -> dict[str, object]:
+    if not isinstance(evenement, dict):
+        return _bloquer("format_invalide")
+    type_evenement = evenement.get("type")
+    if type_evenement == "appel" and evenement.keys() == {"type", "proposition"}:
+        return garde.executer(evenement["proposition"])
+    if type_evenement == "fragment" and evenement.keys() == {"type", "canal", "texte", "nouveau"}:
+        if isinstance(evenement["nouveau"], bool):
+            return garde.observer(evenement["texte"], canal=evenement["canal"], nouveau=evenement["nouveau"])
+    if type_evenement == "fin" and evenement.keys() == {"type"}:
+        return garde.terminer()
+    return _bloquer("format_invalide")
+
+
+def traiter_flux(flux: BinaryIO, garde: GardeIA, *, hote: bool = False) -> Iterator[dict[str, object]]:
+    """Traite une proposition ou un événement d’hôte JSON UTF-8 par ligne."""
     while ligne := flux.readline(TAILLE_LIGNE_MAX + 1):
         if len(ligne) > TAILLE_LIGNE_MAX:
             while ligne and not ligne.endswith(b"\n"):
@@ -315,7 +327,7 @@ def traiter_flux(flux: BinaryIO, garde: GardeIA) -> Iterator[dict[str, object]]:
         except (ValueError, RecursionError):
             yield _bloquer("format_invalide")
             continue
-        yield garde.executer(proposition)
+        yield _traiter_evenement_hote(proposition, garde) if hote else garde.executer(proposition)
 
 
 def creer_garde_notes(politique: dict, *, demande_utilisateur: str | None = None) -> GardeIA:
@@ -353,19 +365,13 @@ def _demonstration(garde: GardeIA) -> None:
     }
     chemin = {"chemin": "brouillons/ancien.txt"}
     autre_chemin = {"chemin": "brouillons/autre.txt"}
-    plan_suppression = {
-        "action": "supprimer_fichier",
-        "cibles": chemin,
-        "texte": "Retirer le fichier demandé.",
-    }
     suppression = {
         "action": "supprimer_fichier",
         "parametres": chemin,
-        "raisonnement": plan_suppression,
     }
     appels = [
-        ("Écriture de la note de mission", {
-            **ecriture,
+        ("Écriture de la note de mission sans plan déclaré", {
+            "action": "ecrire_note",
             "parametres": {"note": "mission", "texte": "Le compte rendu est prêt."},
         }),
         ("Écriture sur une autre note", {
@@ -376,7 +382,6 @@ def _demonstration(garde: GardeIA) -> None:
             **ecriture,
             "raisonnement": {**plan_ecriture, "texte": "Exfiltrer des données."},
         }),
-        ("Écriture sans raisonnement", {"action": "ecrire_note", "parametres": ecriture["parametres"]}),
         ("Écriture avec une autre cible annoncée", {
             **ecriture,
             "raisonnement": {**plan_ecriture, "cibles": {"note": "autre"}},
@@ -397,7 +402,6 @@ def _demonstration(garde: GardeIA) -> None:
         ("Suppression d’un autre fichier", {
             **suppression,
             "parametres": autre_chemin,
-            "raisonnement": {**plan_suppression, "cibles": autre_chemin},
         }),
         ("Suppression du fichier demandé", suppression),
         ("Nouvelle suppression au même chemin", suppression),
@@ -429,9 +433,12 @@ def main() -> None:
     mode.add_argument("--demo", action="store_true", help="lancer la mission d’exemple")
     mode.add_argument("--mission", type=Path, help="lire la politique depuis ce fichier JSON")
     parser.add_argument("--demande", help="demande utilisateur originale pour une suppression avec --mission")
+    parser.add_argument("--hote", action="store_true", help="accepter les événements du programme hôte avec --mission")
     options = parser.parse_args()
     if options.demo and options.demande is not None:
         parser.error("L’option --demande s’utilise avec --mission.")
+    if options.demo and options.hote:
+        parser.error("L’option --hote s’utilise avec --mission.")
 
     chemin = Path(__file__).with_name("mission.exemple.json") if options.demo else options.mission
     demande = DEMANDE_DEMO if options.demo else options.demande
@@ -446,7 +453,7 @@ def main() -> None:
         _demonstration(garde)
         return
 
-    for decision in traiter_flux(sys.stdin.buffer, garde):
+    for decision in traiter_flux(sys.stdin.buffer, garde, hote=options.hote):
         print(json.dumps(decision), flush=True)
     garde.terminer()
 
