@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-secure"
+dynamic = ["version"]
+description = "Garde d’exécution pour les agents IA locaux et cloud"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "mertioz" }]
+
+[project.urls]
+Repository = "https://github.com/mertioz/AI-secure"
+
+[project.scripts]
+ai-secure = "ai_secure.garde_ia:main"
+
+[tool.hatch.version]
+path = "ai_secure/garde_ia.py"
+pattern = '^VERSION = "(?P<version>[^"]+)"'
+
+[tool.hatch.build.targets.wheel]
+packages = ["ai_secure"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"mission.exemple.json" = "ai_secure/mission.exemple.json"
+"mission.travail.exemple.json" = "ai_secure/mission.travail.exemple.json"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/ai_secure/", "/garde_ia.py", "/supervision.py", "/processus_mission.py", "/travail.py",
+  "/mission.exemple.json", "/mission.travail.exemple.json", "/banc_osia.py", "/banc_scenarios.py",
+  "/demo_supervision.py", "/test_*.py", "/pyproject.toml", "/README.md", "/LICENSE",
+]

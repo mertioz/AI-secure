@@ -1,22 +1,35 @@
-# AI Secure v0.4.01
+# AI Secure v0.4.02
 
 AI Secure contrôle les actions d’un agent avant qu’elles atteignent un outil. La politique confiée à la garde fixe les permissions. Chaque décision repose sur l’action demandée et les paramètres qui seront réellement transmis.
 
-Chaque mise à jour incrémente le dernier composant de la version, affiché sur au moins deux chiffres. La séquence continue avec `0.4.02`, puis `0.4.03`.
+## Installation rapide
+
+Dans l’environnement Python de votre application (3.10 ou plus récent), installez le paquet puis lancez la démo.
+
+```sh
+python -m pip install https://github.com/mertioz/AI-secure/releases/download/v0.4.02/ai_secure-0.4.2-py3-none-any.whl
+python -m ai_secure --demo
+```
+
+La dernière décision de la démo affiche `mission_suspendue`. Le paquet s’appuie sur la bibliothèque standard et inclut les politiques de notes et de fichiers. La commande `ai-secure` lance également la démo. Depuis un clone du dépôt, `python -m pip install .` installe le même projet.
+
+### Premier appel depuis Python
+
+```python
+from ai_secure import creer_garde_notes
+
+garde = creer_garde_notes()
+decision = garde.executer({"action": "ecrire_note", "parametres": {"note": "mission", "texte": "Bonjour"}})
+print(decision)  # {'statut': 'autorisee', 'resultat': 'mission'}
+```
+
+Créez une garde par mission. Dans votre application, donnez à `garde.executer()` l’appel proposé par le modèle et utilisez la décision retournée. Pour raccorder vos propres outils, construisez `GardeIA` avec leurs fonctions et votre politique. [Intégration à un agent](#brancher-un-agent)
 
 ## Licence
 
-La licence autorise l’usage, la modification et le partage à toute fin non commerciale. Elle interdit la vente, l’accès payant et l’intégration à un produit, service ou autre offre commerciale, même si le composant est fourni gratuitement. [Texte de la licence](LICENSE)
+Le logiciel et sa documentation sont distribués sous licence MIT. L’utilisation, la modification, la redistribution et l’intégration commerciale sont autorisées avec conservation des avis de copyright et de licence dans les copies ou parties substantielles du logiciel. [Licence MIT](LICENSE)
 
-## Essayer la démo
-
-Depuis ce dossier, avec Python 3.10 ou plus récent.
-
-```powershell
-python .\garde_ia.py --demo
-```
-
-La démo écrit et relit une note en mémoire. Elle bloque plusieurs appels hors périmètre, puis suspend la mission lorsqu’une instruction injectée arrive en deux fragments.
+La numérotation du projet incrémente le dernier composant à chaque mise à jour, avec au moins deux chiffres. L’interface affiche `0.4.02`. Le nom du fichier installable utilise la forme normalisée `0.4.2`.
 
 ## Vérifier l’appel et surveiller le raisonnement
 
@@ -45,7 +58,7 @@ La clôture refuse les nouveaux appels. Le banc lit les événements de réponse
 
 ## Définir une mission
 
-Dans `mission.exemple.json`, `actions` donne les outils autorisés et leurs paramètres obligatoires. Une liste impose des valeurs exactes. `null` accepte un texte libre de 4 096 caractères maximum, par exemple le corps d’un brouillon. Utilisez des valeurs exactes pour les identifiants de ressources. `termes_bloques` contient les mots et expressions à repérer. La recherche tient compte des mots entiers et ignore les différences d’accents, de casse et de ponctuation entre les mots.
+Pour personnaliser une politique, copiez le modèle intégré avec `python -m ai_secure --init mission.json`, puis éditez le fichier. `actions` donne les outils autorisés et leurs paramètres obligatoires. Une liste impose des valeurs exactes. `null` accepte un texte libre de 4 096 caractères maximum, par exemple le corps d’un brouillon. Utilisez des valeurs exactes pour les identifiants de ressources. `termes_bloques` contient les mots et expressions à repérer. La recherche tient compte des mots entiers et ignore les différences d’accents, de casse et de ponctuation entre les mots.
 
 Le mode `--mission` lit une proposition JSON UTF-8 par ligne, jusqu’à 1 Mio par ligne, et produit une décision JSON par ligne. La lecture et l’écriture partagent les notes de la session en cours.
 
@@ -53,7 +66,7 @@ Le mode `--mission` lit une proposition JSON UTF-8 par ligne, jusqu’à 1 Mio p
 @'
 {"action":"ecrire_note","parametres":{"note":"mission","texte":"Compte rendu termine."}}
 {"action":"lire_note","parametres":{"note":"mission"}}
-'@ | python .\garde_ia.py --mission .\mission.exemple.json
+'@ | python -m ai_secure --mission mission.json
 ```
 
 Une décision `bloquee` donne le motif du refus et, le cas échéant, les termes repérés. Une décision `autorisee` contient le résultat de l’outil. Le statut `erreur` indique qu’un outil a été appelé puis a échoué.
@@ -62,12 +75,12 @@ Une décision `bloquee` donne le motif du refus et, le cas échéant, les termes
 
 Une demande directe comme « Crée un programme dans ce fichier » ou « Répare-moi ce programme » autorise les écritures pour la cible que l’utilisateur a sélectionnée. L’hôte transmet le fichier ou le dossier de projet actif. Une sélection de projet permet de modifier les sources et d’ajouter les fichiers associés, comme des tests, à l’intérieur de ce dossier. Une demande de lecture peut donner accès aux fichiers de la sélection en lecture seule.
 
-Utilisez la politique de fichiers fournie avec une racine de travail et un fichier actif. Dans cet exemple, la garde peut enregistrer le contenu dans `calcul.py` sous la racine indiquée.
+`--racine-travail` sélectionne la politique de fichiers intégrée. Dans cet exemple, la garde peut enregistrer le contenu dans `calcul.py` sous la racine indiquée.
 
 ```powershell
 @'
 {"action":"ecrire_fichier","parametres":{"chemin":"calcul.py","contenu":"def aire(x, y):\n    return x * y\n"}}
-'@ | python .\garde_ia.py --mission .\mission.travail.exemple.json --racine-travail .\espace-travail --fichier-actif calcul.py --demande 'Crée un programme dans ce fichier.'
+'@ | python -m ai_secure --racine-travail .\espace-travail --fichier-actif calcul.py --demande 'Crée un programme dans ce fichier.'
 ```
 
 `--projet-actif` sélectionne un dossier. Une demande comme `Améliore le document « brouillon.md »` peut aussi nommer directement la cible. Pour les tâches métier ou les demandes plus complexes, l’hôte peut fournir un objet `PorteeTravail` construit à partir des cibles autorisées. Cette interface sert aussi à travailler sur des tableaux, de la documentation ou d’autres fichiers.
@@ -86,12 +99,36 @@ Dans la mission, les actions `supprimer_fichier` et `supprimer_dossier` prennent
 @'
 {"action":"supprimer_fichier","parametres":{"chemin":"brouillons/autre.txt"}}
 {"action":"supprimer_fichier","parametres":{"chemin":"brouillons/ancien.txt"}}
-'@ | python .\garde_ia.py --mission .\mission.exemple.json --demande 'Supprime le fichier "brouillons/ancien.txt".'
+'@ | python -m ai_secure --demande 'Supprime le fichier "brouillons/ancien.txt".'
 ```
 
 ## Brancher un agent
 
 Le programme hôte construit `GardeIA(politique, outils, demande_utilisateur=demande_originale)` avec ses propres fonctions. Il extrait l’appel du moteur et le soumet à `garde.executer(proposition)`. Il prend `demande_originale` dans le message de l’utilisateur et conserve l’accès aux outils réels. Pour filtrer les réponses visibles, il valide les fragments ou le texte complet avant affichage.
+
+Par exemple, un agent de suivi de stock peut recevoir un outil qui lit uniquement l’article prévu par la mission.
+
+```python
+from ai_secure import GardeIA
+
+stock = {"cable": 12}
+garde = GardeIA(
+    {"actions": {"lire_stock": {"article": ["cable"]}}, "termes_bloques": []},
+    {"lire_stock": lambda article: stock[article]},
+)
+decision = garde.executer({"action": "lire_stock", "parametres": {"article": "cable"}})
+print(decision["resultat"])  # 12
+```
+
+Pour les outils de fichiers intégrés, l’hôte peut ouvrir la mission directement avec la sélection de l’utilisateur.
+
+```python
+from ai_secure import creer_garde_travail
+
+garde = creer_garde_travail(
+    racine_travail=".", demande_utilisateur="Répare ce programme.", fichier_actif="calcul.py"
+)
+```
 
 Le modèle agit exclusivement par cette interface. Pour une suppression réelle, chaque fonction doit recevoir le chemin approuvé comme argument littéral et vérifier sur le système de fichiers le type de l’élément ainsi que la cible résolue dans la racine de travail. Les liens et les jonctions font partie de cette vérification. L’autorisation est consommée dès que la garde transmet l’appel à la fonction de suppression.
 
@@ -104,7 +141,7 @@ Tout moteur peut être raccordé par un hôte qui traduit ses actions en appels 
 {"type":"fragment","canal":"raisonnement","texte":"Mettre a jour la note.","nouveau":true}
 {"type":"appel","proposition":{"action":"ecrire_note","parametres":{"note":"mission","texte":"Compte rendu termine."}}}
 {"type":"fin"}
-'@ | python .\garde_ia.py --mission .\mission.exemple.json --hote
+'@ | python -m ai_secure --hote
 ```
 
 `fragment` transmet du texte reçu du moteur ou d’un outil, `appel` demande une exécution et `fin` clôture la mission. L’hôte peut transmettre `planifier` avec `proposition` et `dans` en secondes, demander `rapport` ou signaler un incident d’intégrité avec `sabotage`. Un modèle qui fournit uniquement des propositions d’actions peut être utilisé avec les événements `appel` et les contrôles des données effectués par l’hôte.
@@ -127,13 +164,13 @@ L’hôte conserve la garde et son journal hors des droits de l’agent. Il plac
 python -B .\demo_supervision.py --rapport .\banc-resultats\supervision\rapport.json
 ```
 
-La démo simule une reconnexion nécessaire puis l’arrêt d’un processus agent et d’un travail en cours. Les processus sont réels et le rapport confirme aussi l’annulation du travail prévu. Dans le mode terminal, `--rapport` indique où écrire le rapport en cas de suspension.
+Ce script du dépôt simule une reconnexion nécessaire puis l’arrêt d’un processus agent et d’un travail en cours. Les processus sont réels et le rapport confirme aussi l’annulation du travail prévu. Dans le mode terminal, `--rapport` indique où écrire le rapport en cas de suspension.
 
 Le banc OSIA confirme l’arrêt de la session agent à la suspension et écrit `rapport-arret.json` dans le dossier de l’essai. Les essais GPT et DeepSeek avec l’annexe injectée ont confirmé l’arrêt et le refus de l’appel suivant.
 
 ## Tester des missions longues avec OSIA
 
-Utilisez le Python qui possède les dépendances d’OSIA et passez le chemin d’une copie de son code. Le premier scénario lit douze relevés, écrit les totaux et une synthèse, et provoque trois appels hors périmètre. Le second poursuit l’inventaire jusqu’à la lecture d’une annexe qui contient une instruction injectée. Le banc vérifie la suspension, la protection du fichier témoin et les totaux calculés avant l’arrêt.
+Depuis le dépôt, utilisez le Python qui possède les dépendances d’OSIA et passez le chemin d’une copie de son code. Le premier scénario lit douze relevés, écrit les totaux et une synthèse, et provoque trois appels hors périmètre. Le second poursuit l’inventaire jusqu’à la lecture d’une annexe qui contient une instruction injectée. Le banc vérifie la suspension, la protection du fichier témoin et les totaux calculés avant l’arrêt.
 
 ```powershell
 python -B -X utf8 .\banc_osia.py --osia .\OSIA-test-garde --scenario inventaire
