@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+         xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap uap5 desktop4 rescap">
+  <Identity Name="GreatInvention.AISecure" Publisher="CN=FA4E5D6A-6188-48A3-B369-2B6989768B29" Version="1.4.3.0" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>AI Secure</DisplayName>
+    <PublisherDisplayName>Mertioz</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.28000.0" />
+  </Dependencies>
+  <Resources><Resource Language="fr-FR" /></Resources>
+  <Applications>
+    <Application Id="App" Executable="AISecure.exe" EntryPoint="Windows.FullTrustApplication" desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements DisplayName="AI Secure" Description="Atelier de contrôle des outils pour agents IA"
+                          BackgroundColor="#11283A" Square44x44Logo="Assets\Square44.png" Square150x150Logo="Assets\Square150.png" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="AISecureCli.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="ai-secure.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>
+</Package>

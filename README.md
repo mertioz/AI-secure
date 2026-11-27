@@ -1,4 +1,4 @@
-# AI Secure v0.4.02
+# AI Secure v0.4.03
 
 AI Secure contrôle les actions d’un agent avant qu’elles atteignent un outil. La politique confiée à la garde fixe les permissions. Chaque décision repose sur l’action demandée et les paramètres qui seront réellement transmis.
 
@@ -7,7 +7,7 @@ AI Secure contrôle les actions d’un agent avant qu’elles atteignent un outi
 Dans l’environnement Python de votre application (3.10 ou plus récent), installez le paquet puis lancez la démo.
 
 ```sh
-python -m pip install https://github.com/mertioz/AI-secure/releases/download/v0.4.02/ai_secure-0.4.2-py3-none-any.whl
+python -m pip install https://github.com/mertioz/AI-secure/releases/download/v0.4.03/ai_secure-0.4.3-py3-none-any.whl
 python -m ai_secure --demo
 ```
 
@@ -29,7 +29,13 @@ Créez une garde par mission. Dans votre application, donnez à `garde.executer(
 
 Le logiciel et sa documentation sont distribués sous licence MIT. L’utilisation, la modification, la redistribution et l’intégration commerciale sont autorisées avec conservation des avis de copyright et de licence dans les copies ou parties substantielles du logiciel. [Licence MIT](LICENSE)
 
-La numérotation du projet incrémente le dernier composant à chaque mise à jour, avec au moins deux chiffres. L’interface affiche `0.4.02`. Le nom du fichier installable utilise la forme normalisée `0.4.2`.
+La numérotation du projet incrémente le dernier composant à chaque mise à jour, avec au moins deux chiffres. L’interface affiche `0.4.03`. Le nom du fichier installable Python utilise la forme normalisée `0.4.3`.
+
+## Édition Windows
+
+L’application MSIX pour PC x64 comprend l’atelier de mission en français, le moteur Python embarqué et la commande `ai-secure.exe`. Depuis le menu Démarrer, ouvrez AI Secure pour essayer des événements JSON, consulter les décisions de la garde, charger une politique de notes ou exporter le rapport de la mission. Dans le terminal, `ai-secure --hote` permet à votre application de transmettre ses propres événements.
+
+Le script `python store/build_msix.py` construit le paquet avec le SDK Windows et le compilateur .NET Framework de Windows. Le résultat et les captures de l’application se trouvent dans `dist/store/`. [Confidentialité](PRIVACY.md)
 
 ## Vérifier l’appel et surveiller le raisonnement
 

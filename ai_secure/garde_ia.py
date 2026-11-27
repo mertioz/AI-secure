@@ -21,7 +21,7 @@ from .travail import (
     ecrire_fichier, lire_fichier, portee_depuis_demande,
 )
 
-VERSION = "0.4.02"
+VERSION = "0.4.03"
 _PAQUET = Path(__file__).resolve().parent
 _SOURCES = _PAQUET.parent if (
     not (_PAQUET / "mission.exemple.json").is_file()
@@ -31,6 +31,9 @@ _SOURCES = _PAQUET.parent if (
 
 
 def _lanceurs_installes() -> tuple[Path, ...]:
+    runtime = _PAQUET.parent
+    if runtime.name == "runtime" and (runtime.parent / "AppxManifest.xml").is_file() and (runtime.parent / "AISecure.exe").is_file():
+        return (runtime.parent,)
     try:
         paquet = distribution("ai-secure")
     except PackageNotFoundError:

@@ -33,5 +33,5 @@ packages = ["ai_secure"]
 include = [
   "/ai_secure/", "/garde_ia.py", "/supervision.py", "/processus_mission.py", "/travail.py",
   "/mission.exemple.json", "/mission.travail.exemple.json", "/banc_osia.py", "/banc_scenarios.py",
-  "/demo_supervision.py", "/test_*.py", "/pyproject.toml", "/README.md", "/LICENSE",
+  "/demo_supervision.py", "/test_*.py", "/pyproject.toml", "/README.md", "/PRIVACY.md", "/LICENSE", "/store/",
 ]
